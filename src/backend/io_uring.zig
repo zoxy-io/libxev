@@ -65,8 +65,22 @@ pub const Loop = struct {
         const entries = std.math.cast(u13, options.entries) orelse
             return error.TooManyEntries;
 
+        // Build the params ourselves rather than calling IoUring.init so a
+        // caller can request a completion queue deeper than the default
+        // 2 × entries (IORING_SETUP_CQSIZE). Otherwise mirror
+        // IoUring.init's own defaults (sq_thread_idle = 1s); the kernel
+        // fills sq_entries and validates the rest.
+        var params = std.mem.zeroInit(linux.io_uring_params, .{
+            .flags = options.io_uring_flags,
+            .sq_thread_idle = 1000,
+        });
+        if (options.cq_entries != 0) {
+            params.flags |= linux.IORING_SETUP_CQSIZE;
+            params.cq_entries = options.cq_entries;
+        }
+
         var result: Loop = .{
-            .ring = try linux.IoUring.init(entries, options.io_uring_flags),
+            .ring = try linux.IoUring.init_params(entries, &params),
         };
         result.update_now();
 
@@ -1143,6 +1157,27 @@ test "io_uring: overflow entries count" {
         try testing.expectError(error.TooManyEntries, Loop.init(.{
             .entries = std.math.pow(u14, 2, 13),
         }));
+    }
+}
+
+test "io_uring: cq_entries deepens the completion queue" {
+    const testing = std.testing;
+
+    // Default: the kernel fixes the CQ at 2 × entries.
+    {
+        var loop = try Loop.init(.{ .entries = 256 });
+        defer loop.deinit();
+        try testing.expectEqual(@as(usize, 512), loop.ring.cq.cqes.len);
+    }
+
+    // IORING_SETUP_CQSIZE: a CQ deeper than 2 × entries and decoupled from
+    // the submission-queue depth — the lever for many in-flight completions
+    // against a modest SQ.
+    {
+        var loop = try Loop.init(.{ .entries = 256, .cq_entries = 4096 });
+        defer loop.deinit();
+        try testing.expect(loop.ring.cq.cqes.len > 2 * 256);
+        try testing.expectEqual(@as(usize, 4096), loop.ring.cq.cqes.len);
     }
 }
 

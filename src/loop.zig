@@ -31,6 +31,22 @@ pub const Options = struct {
     /// Backends: io_uring
     io_uring_flags: u32 = 0,
 
+    /// Requested completion-queue depth. When non-zero, the loop is set up
+    /// with IORING_SETUP_CQSIZE and the kernel sizes the CQ to at least this
+    /// many entries instead of the default 2 × `entries`, decoupling
+    /// completion capacity from submission-queue depth — the lever for many
+    /// in-flight completions against a modest SQ. Zero keeps the default
+    /// sizing (CQ = 2 × `entries`).
+    ///
+    /// Should be >= `entries`; the kernel rounds a non-power-of-two up to
+    /// the next power of two and caps the result at its maximum (65536 on
+    /// current kernels). As with `io_uring_flags`, the caller owns
+    /// validity: an over-cap or otherwise rejected value fails Loop.init
+    /// with error.ArgumentsInvalid rather than degrading.
+    ///
+    /// Backends: io_uring
+    cq_entries: u32 = 0,
+
     /// A thread pool to use for blocking operations. If the backend doesn't
     /// need to perform any blocking operations then no threads will ever
     /// be spawned. If the backend does need to perform blocking operations
