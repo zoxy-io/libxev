@@ -641,6 +641,22 @@ pub const Completion = struct {
         state: State = .dead,
     } = .{},
 
+    /// The raw errno of this completion's last failure, or `.SUCCESS` if it
+    /// succeeded. Set by `invoke` on every completion; read-only to callers.
+    ///
+    /// Each operation's result mapping names a handful of errnos and funnels
+    /// the rest through `posix.unexpectedErrno`, collapsing them into
+    /// `error.Unexpected`. That is the right default for control flow — a
+    /// caller should not switch on twenty errnos — but it discards the one
+    /// thing an operator needs to tell ENOBUFS (socket buffers full) from
+    /// EADDRNOTAVAIL (ephemeral ports exhausted): failures that arrive
+    /// identical and want opposite responses.
+    ///
+    /// Recording it costs a single store on a path that has already failed,
+    /// and changes no error set, no result, and no control flow, so callers
+    /// that never read it are unaffected.
+    result_errno: posix.E = .SUCCESS,
+
     const State = enum(u1) {
         /// completion is not part of any loop
         dead = 0,
@@ -672,6 +688,12 @@ pub const Completion = struct {
     /// Invokes the callback for this completion after properly constructing
     /// the Result based on the res code.
     fn invoke(self: *Completion, loop: *Loop, res: i32) CallbackAction {
+        // Recorded before the per-operation mapping below runs, because that
+        // is where the errno stops existing: every arm's `else` branch hands
+        // it to `posix.unexpectedErrno`, which returns `error.Unexpected` and
+        // keeps nothing. A negative res is the kernel's `-errno` in the same
+        // encoding each arm already decodes.
+        self.result_errno = if (res < 0) @enumFromInt(-res) else .SUCCESS;
         const result: Result = switch (self.op) {
             .noop => unreachable,
 
@@ -1821,4 +1843,47 @@ test "io_uring: socket read cancellation" {
     try loop.run(.until_done);
     try testing.expectEqual(OperationType.read, @as(OperationType, read_result));
     try testing.expectError(error.Canceled, read_result.read);
+}
+
+test "io_uring: result_errno outlives the mapping to a typed error" {
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // Connecting to a closed loopback port fails with ECONNREFUSED — an
+    // errno the connect arm *does* name. Using a mapped one on purpose: it
+    // pins that the field carries the same errno the mapping saw, against a
+    // typed error rather than against a guess about an unmapped path.
+    const address = try net.Address.parseIp4("127.0.0.1", 1);
+    const socket = try xev_posix.socket(
+        address.any.family,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        0,
+    );
+    defer xev_posix.close(socket);
+
+    var connect_result: Result = undefined;
+    var c_connect: Completion = .{
+        .op = .{ .connect = .{ .socket = socket, .addr = address } },
+        .userdata = &connect_result,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, l: *Loop, c: *Completion, r: Result) CallbackAction {
+                _ = l;
+                _ = c;
+                @as(*Result, @ptrCast(@alignCast(ud.?))).* = r;
+                return .disarm;
+            }
+        }).callback,
+    };
+
+    // Before the completion runs the field is SUCCESS, so "no failure" is
+    // distinguishable from "a failure whose errno we did not record".
+    try testing.expectEqual(posix.E.SUCCESS, c_connect.result_errno);
+
+    loop.add(&c_connect);
+    try loop.run(.until_done);
+
+    try testing.expectError(error.ConnectionRefused, connect_result.connect);
+    try testing.expectEqual(posix.E.CONNREFUSED, c_connect.result_errno);
 }
