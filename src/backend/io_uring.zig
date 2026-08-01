@@ -205,7 +205,7 @@ pub const Loop = struct {
                 const c = @as(?*Completion, @ptrFromInt(@as(usize, @intCast(cqe.user_data)))) orelse continue;
                 self.active -= 1;
                 c.flags.state = .dead;
-                switch (c.invoke(self, cqe.res)) {
+                switch (c.invoke(self, cqe.res, cqe.flags)) {
                     .disarm => {},
                     .rearm => self.add(c),
                 }
@@ -478,6 +478,16 @@ pub const Loop = struct {
                 ),
             },
 
+            // The same shape std's IoUring.recv uses for its
+            // `buffer_selection` arm: no address, the cap in `len`, the
+            // group in `buf_index`, and IOSQE_BUFFER_SELECT to make the
+            // kernel pick the buffer at delivery time.
+            .recv_group => |*v| {
+                sqe.prep_rw(.RECV, v.fd, 0, v.max_len, 0);
+                sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+                sqe.buf_index = v.group_id;
+            },
+
             .recvmsg => |*v| {
                 sqe.prep_recvmsg(
                     v.fd,
@@ -657,6 +667,17 @@ pub const Completion = struct {
     /// that never read it are unaffected.
     result_errno: posix.E = .SUCCESS,
 
+    /// The raw cqe flags of this completion's last delivery, or 0. Set by
+    /// `invoke` on every completion; read-only to callers.
+    ///
+    /// The flags word is where the kernel reports facts that have no home
+    /// in `res`: for a `recv_group` receive, `IORING_CQE_F_BUFFER` plus the
+    /// id of the provided buffer the kernel selected. Kept raw for the same
+    /// reason `result_errno` is — the mapping layer should not decide today
+    /// which bits a caller will need tomorrow. Use `bufferId` rather than
+    /// decoding by hand.
+    result_flags: u32 = 0,
+
     const State = enum(u1) {
         /// completion is not part of any loop
         dead = 0,
@@ -685,15 +706,27 @@ pub const Completion = struct {
         };
     }
 
+    /// Returns the id of the provided buffer the kernel selected for this
+    /// completion's last delivery, or null if none was selected. Only a
+    /// `recv_group` receive that actually delivered data selects a buffer;
+    /// an EOF or error completes without one, and the kernel says which
+    /// happened through `IORING_CQE_F_BUFFER` — so callers should trust
+    /// this over any assumption about their operation's outcome.
+    pub fn bufferId(self: *const Completion) ?u16 {
+        if (self.result_flags & linux.IORING_CQE_F_BUFFER == 0) return null;
+        return @intCast(self.result_flags >> linux.IORING_CQE_BUFFER_SHIFT);
+    }
+
     /// Invokes the callback for this completion after properly constructing
     /// the Result based on the res code.
-    fn invoke(self: *Completion, loop: *Loop, res: i32) CallbackAction {
+    fn invoke(self: *Completion, loop: *Loop, res: i32, cqe_flags: u32) CallbackAction {
         // Recorded before the per-operation mapping below runs, because that
         // is where the errno stops existing: every arm's `else` branch hands
         // it to `posix.unexpectedErrno`, which returns `error.Unexpected` and
         // keeps nothing. A negative res is the kernel's `-errno` in the same
         // encoding each arm already decodes.
         self.result_errno = if (res < 0) @enumFromInt(-res) else .SUCCESS;
+        self.result_flags = cqe_flags;
         const result: Result = switch (self.op) {
             .noop => unreachable,
 
@@ -739,6 +772,10 @@ pub const Completion = struct {
 
             .recv => .{
                 .recv = self.readResult(.recv, res),
+            },
+
+            .recv_group => .{
+                .recv_group = self.readResult(.recv_group, res),
             },
 
             .recvmsg => .{
@@ -865,6 +902,13 @@ pub const Completion = struct {
         return switch (@as(posix.E, @enumFromInt(-res))) {
             .CANCELED => error.Canceled,
             .CONNRESET => error.ConnectionResetByPeer,
+
+            // A `recv_group` receive found its provided-buffer group empty
+            // at the moment data arrived. This is the one failure a caller
+            // armed the operation to hear about — it is backpressure, not a
+            // fault — so it must survive the mapping as itself rather than
+            // collapse into `error.Unexpected`.
+            .NOBUFS => error.NoBuffers,
             else => |errno| posix.unexpectedErrno(errno),
         };
     }
@@ -896,6 +940,10 @@ pub const OperationType = enum {
 
     /// Receive a message from a socket.
     recv,
+
+    /// Receive a message from a socket into a buffer the kernel selects
+    /// from a registered provided-buffer group (IOSQE_BUFFER_SELECT).
+    recv_group,
 
     /// Send a message on a socket.
     send,
@@ -937,6 +985,7 @@ pub const Result = union(OperationType) {
     read: ReadError!usize,
     pread: ReadError!usize,
     recv: ReadError!usize,
+    recv_group: ReadError!usize,
     send: WriteError!usize,
     sendmsg: WriteError!usize,
     recvmsg: ReadError!usize,
@@ -990,6 +1039,20 @@ pub const Operation = union(OperationType) {
     recv: struct {
         fd: posix.fd_t,
         buffer: ReadBuffer,
+    },
+
+    recv_group: struct {
+        fd: posix.fd_t,
+
+        /// The provided-buffer group to select from. The group must have
+        /// been registered on this loop's ring (`setup_buf_ring`) before
+        /// the operation is queued; this backend only arms the selection.
+        group_id: u16,
+
+        /// Cap on the bytes received into the selected buffer. The kernel
+        /// truncates to the buffer's own size; stating the cap explicitly
+        /// keeps the operation's meaning independent of kernel defaults.
+        max_len: u32,
     },
 
     send: struct {
@@ -1120,6 +1183,11 @@ pub const ReadError = error{
     Canceled,
     Unexpected,
     ConnectionResetByPeer,
+
+    /// A `recv_group` receive arrived to an empty provided-buffer group.
+    /// The data is still in the socket; re-arm after returning a buffer
+    /// to the ring, or treat it as backpressure and shed.
+    NoBuffers,
 };
 
 pub const ShutdownError = error{
@@ -1886,4 +1954,187 @@ test "io_uring: result_errno outlives the mapping to a typed error" {
 
     try testing.expectError(error.ConnectionRefused, connect_result.connect);
     try testing.expectEqual(posix.E.CONNREFUSED, c_connect.result_errno);
+}
+
+test "io_uring: recv_group selects, exhausts, and reuses a provided buffer" {
+    const mem = std.mem;
+    const os = posix;
+    const testing = std.testing;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // A one-buffer group: the smallest ring that can show all three
+    // behaviors in sequence — selection, exhaustion, and reuse after a
+    // syscall-free return.
+    const group_id: u16 = 1;
+    var pool_buf: [64]u8 = undefined;
+    const br = linux.IoUring.setup_buf_ring(loop.ring.fd, 1, group_id, .{ .inc = false }) catch |err| switch (err) {
+        // EINVAL from io_uring_register with known-good arguments means
+        // the kernel predates IORING_REGISTER_PBUF_RING (5.19).
+        error.ArgumentsInvalid => return error.SkipZigTest,
+        else => return err,
+    };
+    linux.IoUring.buf_ring_init(br);
+    defer linux.IoUring.free_buf_ring(loop.ring.fd, br, 1, group_id);
+    const mask = linux.IoUring.buf_ring_mask(1);
+    linux.IoUring.buf_ring_add(br, &pool_buf, 0, mask, 0);
+    linux.IoUring.buf_ring_advance(br, 1);
+
+    // Create a TCP server socket
+    const address = try net.Address.parseIp4("127.0.0.1", 3131);
+    const kernel_backlog = 1;
+    const ln = try xev_posix.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
+    errdefer xev_posix.close(ln);
+    try os.setsockopt(ln, os.SOL.SOCKET, os.SO.REUSEADDR, &mem.toBytes(@as(c_int, 1)));
+    try xev_posix.bind(ln, &address.any, address.getOsSockLen());
+    try xev_posix.listen(ln, kernel_backlog);
+
+    // Create a TCP client socket. No errdefer: the test closes it mid-flow
+    // for the EOF phase, and a failing assertion after that point would
+    // otherwise double-close and panic over the failure worth reading.
+    const client_conn = try xev_posix.socket(address.any.family, os.SOCK.STREAM | os.SOCK.CLOEXEC, 0);
+
+    // Accept
+    var server_conn: os.socket_t = 0;
+    var c_accept: Completion = .{
+        .op = .{
+            .accept = .{
+                .socket = ln,
+            },
+        },
+
+        .userdata = &server_conn,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, l: *Loop, c: *Completion, r: Result) CallbackAction {
+                _ = l;
+                _ = c;
+                const conn = @as(*os.socket_t, @ptrCast(@alignCast(ud.?)));
+                conn.* = r.accept catch unreachable;
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&c_accept);
+
+    // Connect
+    var connected = false;
+    var c_connect: Completion = .{
+        .op = .{
+            .connect = .{
+                .socket = client_conn,
+                .addr = address,
+            },
+        },
+
+        .userdata = &connected,
+        .callback = (struct {
+            fn callback(ud: ?*anyopaque, l: *Loop, c: *Completion, r: Result) CallbackAction {
+                _ = l;
+                _ = c;
+                _ = r.connect catch unreachable;
+                const b = @as(*bool, @ptrCast(ud.?));
+                b.* = true;
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&c_connect);
+    try loop.run(.until_done);
+    try testing.expect(server_conn > 0);
+    try testing.expect(connected);
+
+    const Recv = struct {
+        result: ReadError!usize = 0,
+
+        fn callback(ud: ?*anyopaque, l: *Loop, c: *Completion, r: Result) CallbackAction {
+            _ = l;
+            _ = c;
+            @as(*@This(), @ptrCast(@alignCast(ud.?))).result = r.recv_group;
+            return .disarm;
+        }
+    };
+
+    // Selection: data arrives, the kernel picks the one buffer and says
+    // so through the cqe flags.
+    var c_send: Completion = .{
+        .op = .{
+            .send = .{
+                .fd = client_conn,
+                .buffer = .{ .slice = &[_]u8{ 1, 1, 2, 3, 5, 8, 13 } },
+            },
+        },
+    };
+    loop.add(&c_send);
+
+    var recv: Recv = .{};
+    var c_recv: Completion = .{
+        .op = .{
+            .recv_group = .{
+                .fd = server_conn,
+                .group_id = group_id,
+                .max_len = pool_buf.len,
+            },
+        },
+
+        .userdata = &recv,
+        .callback = Recv.callback,
+    };
+    loop.add(&c_recv);
+    try loop.run(.until_done);
+    try testing.expectEqual(@as(usize, 7), try recv.result);
+    try testing.expectEqual(@as(?u16, 0), c_recv.bufferId());
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 1, 2, 3, 5, 8, 13 }, pool_buf[0..7]);
+
+    // Exhaustion: the buffer was not returned, so the next arrival finds
+    // the group empty — NoBuffers, no buffer selected, errno preserved.
+    c_send.op.send.buffer = .{ .slice = &[_]u8{ 21, 34, 55 } };
+    loop.add(&c_send);
+    c_recv.op.recv_group = .{
+        .fd = server_conn,
+        .group_id = group_id,
+        .max_len = pool_buf.len,
+    };
+    loop.add(&c_recv);
+    try loop.run(.until_done);
+    try testing.expectError(error.NoBuffers, recv.result);
+    try testing.expectEqual(posix.E.NOBUFS, c_recv.result_errno);
+    try testing.expectEqual(@as(?u16, null), c_recv.bufferId());
+
+    // Reuse: returning the buffer is two plain stores and an atomic tail
+    // bump — no syscall — and the bytes that provoked NoBuffers are still
+    // in the socket, so the re-armed receive delivers them.
+    linux.IoUring.buf_ring_add(br, &pool_buf, 0, mask, 0);
+    linux.IoUring.buf_ring_advance(br, 1);
+    c_recv.op.recv_group = .{
+        .fd = server_conn,
+        .group_id = group_id,
+        .max_len = pool_buf.len,
+    };
+    loop.add(&c_recv);
+    try loop.run(.until_done);
+    try testing.expectEqual(@as(usize, 3), try recv.result);
+    try testing.expectEqual(@as(?u16, 0), c_recv.bufferId());
+    try testing.expectEqualSlices(u8, &[_]u8{ 21, 34, 55 }, pool_buf[0..3]);
+
+    // EOF: the peer is gone, the receive completes with EOF and the flags
+    // say no buffer was consumed for it — an idle socket's teardown cannot
+    // leak a pooled buffer. The ring is restocked first so this proves EOF
+    // semantics, not another exhaustion (an empty group with a pending EOF
+    // may answer either way; a stocked one may not).
+    linux.IoUring.buf_ring_add(br, &pool_buf, 0, mask, 0);
+    linux.IoUring.buf_ring_advance(br, 1);
+    xev_posix.close(client_conn);
+    c_recv.op.recv_group = .{
+        .fd = server_conn,
+        .group_id = group_id,
+        .max_len = pool_buf.len,
+    };
+    loop.add(&c_recv);
+    try loop.run(.until_done);
+    try testing.expectError(error.EOF, recv.result);
+    try testing.expectEqual(@as(?u16, null), c_recv.bufferId());
+
+    xev_posix.close(server_conn);
+    xev_posix.close(ln);
 }
