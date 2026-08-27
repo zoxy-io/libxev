@@ -1454,8 +1454,9 @@ pub const TimerTrigger = enum {
 test "Completion size" {
     const testing = std.testing;
 
-    // Just so we are aware when we change the size
-    try testing.expectEqual(@as(usize, 184), @sizeOf(Completion));
+    // Just so we are aware when we change the size. 184 before the
+    // `connect` op learned AF_UNIX; see the io_uring backend's guard.
+    try testing.expectEqual(@as(usize, 208), @sizeOf(Completion));
 }
 
 test "epoll: default completion" {
