@@ -12,6 +12,7 @@ pub const net = struct {
         any: posix.sockaddr,
         in: posix.sockaddr.in,
         in6: posix.sockaddr.in6,
+        un: posix.sockaddr.un,
 
         pub fn parseIp4(text: []const u8, port: u16) !Address {
             return initIp4((try std.Io.net.Ip4Address.parse(text, port)).bytes, port);
@@ -38,6 +39,40 @@ pub const net = struct {
             return result;
         }
 
+        pub const UnixError = error{NameTooLong};
+
+        /// A filesystem-namespace `AF_UNIX` address for `path`.
+        ///
+        /// The path is stored NUL-terminated and `getOsSockLen` reports
+        /// the exact length that terminator implies, which is what the
+        /// kernel documents for a pathname socket (`unix(7)`) and what
+        /// every other length would have to be justified against.
+        ///
+        /// Abstract-namespace addresses (a leading NUL) are deliberately
+        /// not constructible here: they carry no terminator, so their
+        /// length is the caller's to state rather than this function's to
+        /// derive, and conflating the two is where the family's length
+        /// bugs live.
+        pub fn initUnix(path: []const u8) UnixError!Address {
+            const capacity = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;
+            // One byte reserved for the terminator the kernel expects.
+            if (path.len == 0 or path.len >= capacity) return error.NameTooLong;
+            var result: Address = undefined;
+            result.un = std.mem.zeroes(posix.sockaddr.un);
+            result.un.family = posix.AF.UNIX;
+            @memcpy(result.un.path[0..path.len], path);
+            if (@hasField(posix.sockaddr.un, "len")) {
+                result.un.len = @intCast(unixSockLen(path.len));
+            }
+            return result;
+        }
+
+        /// The `sockaddr_un` length for a pathname of `path_len` bytes:
+        /// everything before `path`, the path, and its terminator.
+        fn unixSockLen(path_len: usize) posix.socklen_t {
+            return @intCast(@offsetOf(posix.sockaddr.un, "path") + path_len + 1);
+        }
+
         pub fn initPosix(addr: *const posix.sockaddr) Address {
             var result: Address = undefined;
             switch (addr.family) {
@@ -52,6 +87,13 @@ pub const net = struct {
             return switch (self.any.family) {
                 posix.AF.INET => @sizeOf(posix.sockaddr.in),
                 posix.AF.INET6 => @sizeOf(posix.sockaddr.in6),
+                // A pathname socket's length is derived from the path,
+                // not from the struct: passing `@sizeOf(sockaddr_un)`
+                // would make the kernel read the whole 108-byte array,
+                // and passing `@sizeOf(sockaddr)` — what this arm used to
+                // return for every unrecognised family — truncates the
+                // path to thirteen characters.
+                posix.AF.UNIX => unixSockLen(std.mem.sliceTo(&self.un.path, 0).len),
                 else => @sizeOf(posix.sockaddr),
             };
         }
@@ -691,4 +733,36 @@ pub fn pipe2(flags: posix.O) PipeError![2]posix.fd_t {
     }
 
     return fds;
+}
+
+test "net.Address: a pathname socket reports the length its terminator implies" {
+    const testing = std.testing;
+    const address = try net.Address.initUnix("/run/app.sock");
+    try testing.expectEqual(posix.AF.UNIX, address.un.family);
+    try testing.expectEqualStrings("/run/app.sock", std.mem.sliceTo(&address.un.path, 0));
+    // Everything before `path`, the thirteen bytes, and the NUL — not
+    // `@sizeOf(sockaddr_un)`, which would hand the kernel 95 bytes of
+    // padding, and not `@sizeOf(sockaddr)`, which truncated the path.
+    try testing.expectEqual(
+        @as(posix.socklen_t, @offsetOf(posix.sockaddr.un, "path") + 14),
+        address.getOsSockLen(),
+    );
+    // The bytes past the path stay zero, so two addresses built from the
+    // same path compare equal however the caller's buffer was reused.
+    try testing.expectEqual(@as(u8, 0), address.un.path[14]);
+}
+
+test "net.Address: a path with no room for its terminator is refused" {
+    const testing = std.testing;
+    const capacity = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;
+    var longest: [capacity - 1]u8 = undefined;
+    @memset(&longest, 'a');
+    _ = try net.Address.initUnix(&longest);
+
+    var too_long: [capacity]u8 = undefined;
+    @memset(&too_long, 'a');
+    try testing.expectError(error.NameTooLong, net.Address.initUnix(&too_long));
+    // An empty path is not a pathname socket — it is the abstract
+    // namespace, which this constructor deliberately does not build.
+    try testing.expectError(error.NameTooLong, net.Address.initUnix(""));
 }

@@ -6,6 +6,10 @@ const builtin = @import("builtin");
 /// API of this package.
 const xev = Backend.default().Api();
 pub const dynamic = xev.dynamic;
+/// The posix address forms the watchers take. Exported because a family
+/// with no `std.Io.net` spelling — `AF_UNIX` — can only be named this
+/// way, and `TCP.initAddress`/`connectAddress` take it.
+pub const net = @import("posix.zig").net;
 pub const backend = xev.backend;
 pub const available = xev.available;
 pub const noopCallback = xev.noopCallback;

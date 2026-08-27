@@ -46,9 +46,15 @@ fn TCPStream(comptime xev: type) type {
         /// the family is used, the actual address has no impact on the created
         /// resource.
         pub fn init(addr: std.Io.net.IpAddress) !Self {
+            return initAddress(net.Address.fromIpAddress(addr));
+        }
+
+        /// `init` for an address that is already in its posix form —
+        /// which is how a family with no `std.Io.net` spelling, such as
+        /// `AF_UNIX`, reaches this type at all.
+        pub fn initAddress(posix_addr: net.Address) !Self {
             if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
 
-            const posix_addr = net.Address.fromIpAddress(addr);
             const fd = if (xev.backend == .iocp)
                 try windows.WSASocketW(posix_addr.any.family, windows.ws2_32.SOCK.STREAM, 0, null, 0, windows.ws2_32.WSA_FLAG_OVERLAPPED)
             else fd: {
@@ -172,9 +178,28 @@ fn TCPStream(comptime xev: type) type {
                 r: xev.ConnectError!void,
             ) xev.CallbackAction,
         ) void {
+            self.connectAddress(loop, c, net.Address.fromIpAddress(addr), Userdata, userdata, cb);
+        }
+
+        /// `connect` to an address already in its posix form — the entry
+        /// point a family outside `std.Io.net.IpAddress` needs.
+        pub fn connectAddress(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            posix_addr: net.Address,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                s: Self,
+                r: xev.ConnectError!void,
+            ) xev.CallbackAction,
+        ) void {
             if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
 
-            const posix_addr = net.Address.fromIpAddress(addr);
             c.* = .{
                 .op = .{
                     .connect = .{

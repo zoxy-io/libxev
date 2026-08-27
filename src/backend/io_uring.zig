@@ -1227,8 +1227,11 @@ pub const TimerTrigger = enum {
 test "Completion size" {
     const testing = std.testing;
 
-    // Just so we are aware when we change the size
-    try testing.expectEqual(@as(usize, 128), @sizeOf(Completion));
+    // Just so we are aware when we change the size. 128 before the
+    // `connect` op learned AF_UNIX: a `sockaddr_un` carries a 108-byte
+    // path inline, which the kernel must read from one contiguous
+    // address, so it is the completion that has to hold it.
+    try testing.expectEqual(@as(usize, 152), @sizeOf(Completion));
 }
 
 test "io_uring: available" {
