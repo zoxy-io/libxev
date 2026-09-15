@@ -255,11 +255,51 @@ pub const Loop = struct {
 
                 // If EV_ERROR is set, then submission failed for this
                 // completion. We get the syscall errorcode from data and
-                // store it.
+                // store it. Errors belong to this reply by construction:
+                // the completion came out of `queued` into the changelist
+                // we just handed over, so it is linked nowhere.
                 if (ev.flags & std.c.EV.ERROR != 0) {
                     c.result = c.syscall_result(-@as(i32, @intCast(ev.data)));
                 } else {
-                    // No error, means that this completion is ready to work.
+                    // Readiness, on the other hand, is not ours at all.
+                    //
+                    // The eventlist aliases the changelist so the kernel
+                    // has somewhere to report a per-change EV_ERROR, but
+                    // the same reply also carries readiness — and this
+                    // function can call kevent more than once, because a
+                    // submission queue longer than `events.len` is drained
+                    // one batch at a time. A completion started by batch 1
+                    // is registered and, if its socket is writable, comes
+                    // back as ready in batch 2's reply. It was pushed onto
+                    // `completions` the first time, so the second push
+                    // splices a node that is already linked, and one
+                    // intrusive list grows a branch into the other:
+                    // `queue.push`'s assert is the loud version, and with
+                    // assertions off the loop spins on the resulting cycle
+                    // forever, never returning to the kernel.
+                    //
+                    // That is why this surfaces as a cliff at exactly one
+                    // batch of concurrent work: below `events.len` there is
+                    // only ever one kevent call here, so nothing can be
+                    // reported to it twice.
+                    //
+                    // Leaving readiness alone costs nothing. Every filter
+                    // this backend registers is level-triggered (EV_ADD |
+                    // EV_ENABLE, never EV_CLEAR or EV_ONESHOT), so the wait
+                    // reports it again through the path that owns it —
+                    // which is the same split this reply's error handling
+                    // already assumes, the wait having ignored EV_ERROR
+                    // since it was written.
+                    //
+                    // EVFILT_MACHPORT is the one exception, because it
+                    // delivers rather than signals: it arms with
+                    // MACH_RCV_MSG, so the kevent reporting it has already
+                    // dequeued the message into the completion's buffer.
+                    // Dropping that report drops the message, and an
+                    // `xev.Async` notify is lost for good.
+                    if (comptime builtin.os.tag.isDarwin()) {
+                        if (ev.filter != std.c.EVFILT.MACHPORT) continue;
+                    } else continue;
                     c.result = c.perform(&ev);
                 }
 
@@ -2969,4 +3009,70 @@ test "kqueue: socket accept/cancel cancellation should decrease active count" {
     // Wait for the sockets to close
     try loop.run(.until_done);
     try testing.expect(ln == 0);
+}
+
+test "kqueue: submit must not consume readiness reported to a later batch" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // Sized against `submit`'s changelist rather than a round number. One
+    // batch is the whole precondition: a submission queue that fits in it
+    // costs a single kevent, and nothing can be reported to a single call
+    // twice. Past it the queue is drained in two, and every completion the
+    // first batch registered is a candidate to come back as ready in the
+    // second batch's reply — already completed, already linked.
+    const n = 256 + 44;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    var fds: [n][2]posix.fd_t = undefined;
+    var opened: usize = 0;
+    errdefer for (fds[0..opened]) |p| {
+        xev_posix.close(p[0]);
+        xev_posix.close(p[1]);
+    };
+    while (opened < n) : (opened += 1) fds[opened] = try xev_posix.pipe2(.{ .CLOEXEC = true });
+    defer for (fds) |p| {
+        xev_posix.close(p[0]);
+        xev_posix.close(p[1]);
+    };
+
+    // Writes, because a fresh pipe is writable the instant it is
+    // registered: every completion batch 1 submits is ready before batch 2
+    // asks the kernel anything.
+    var done: usize = 0;
+    var cs: [n]Completion = undefined;
+    for (&cs, 0..) |*c, i| {
+        c.* = .{
+            .op = .{ .write = .{
+                .fd = fds[i][1],
+                .buffer = .{ .slice = "x" },
+            } },
+            .userdata = &done,
+            .callback = (struct {
+                fn callback(
+                    ud: ?*anyopaque,
+                    l: *Loop,
+                    c_inner: *Completion,
+                    r: Result,
+                ) CallbackAction {
+                    _ = l;
+                    _ = c_inner;
+                    _ = r.write catch unreachable;
+                    const count: *usize = @ptrCast(@alignCast(ud.?));
+                    count.* += 1;
+                    return .disarm;
+                }
+            }).callback,
+        };
+        loop.add(c);
+    }
+
+    // All `n` are queued against one `submit`, which is what puts a batch
+    // boundary inside it. Before the fix this trips `queue.push`'s
+    // `v.next == null` on the first duplicate report (issues #122, #169).
+    try loop.run(.until_done);
+    try testing.expectEqual(@as(usize, n), done);
 }
