@@ -134,7 +134,7 @@ fn UDPSendto(comptime xev: type) type {
                                     l_inner,
                                     c_inner,
                                     s_inner,
-                                    net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)).toIpAddress(),
+                                    peerAddress(@alignCast(&c_inner.op.recvfrom.addr), if (r.recvfrom) |_| true else |_| false),
                                     initFd(c_inner.op.recvfrom.fd),
                                     c_inner.op.recvfrom.buffer,
                                     r.recvfrom,
@@ -315,7 +315,7 @@ fn UDPSendtoIOCP(comptime xev: type) type {
                                     l_inner,
                                     c_inner,
                                     s_inner,
-                                    net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)).toIpAddress(),
+                                    peerAddress(@alignCast(&c_inner.op.recvfrom.addr), if (r.recvfrom) |_| true else |_| false),
                                     initFd(c_inner.op.recvfrom.fd),
                                     c_inner.op.recvfrom.buffer,
                                     r.recvfrom,
@@ -552,7 +552,7 @@ fn UDPSendMsg(comptime xev: type) type {
                             l_inner,
                             c_inner,
                             s_inner,
-                            net.Address.initPosix(@ptrCast(&s_inner.op.recv.addr_buffer)).toIpAddress(),
+                            peerAddress(@ptrCast(&s_inner.op.recv.addr_buffer), if (r.recvmsg) |_| true else |_| false),
                             initFd(c_inner.op.recvmsg.fd),
                             s_inner.op.recv.buf,
                             if (r.recvmsg) |v| v else |err| err,
@@ -910,6 +910,21 @@ fn UDPDynamic(comptime xev: type) type {
     };
 }
 
+/// The sender of a completed receive, decoded only when the receive
+/// succeeded: a receive that failed — canceled, most often — never had its
+/// address storage written, and decoding what it holds reaches the
+/// `unreachable` in `toIpAddress` on whatever family the stale bytes name.
+/// A failed receive reports the unspecified IPv4 address instead, which no
+/// caller can mistake for a peer: nothing sends from port 0.
+fn peerAddress(storage: *align(4) const posix.sockaddr, succeeded: bool) std.Io.net.IpAddress {
+    const unspecified: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    if (!succeeded) return unspecified;
+    return switch (storage.family) {
+        posix.AF.INET, posix.AF.INET6 => net.Address.initPosix(storage).toIpAddress(),
+        else => unspecified,
+    };
+}
+
 fn UDPTests(comptime xev: type, comptime Impl: type) type {
     return struct {
         test "UDP: Stream decls" {
@@ -922,6 +937,61 @@ fn UDPTests(comptime xev: type, comptime Impl: type) type {
                     @compileError("missing decl: " ++ decl.name);
                 }
             }
+        }
+
+        test "UDP: a canceled read delivers its error, not a decoded address" {
+            // The raw cancel op is the io_uring backend's own Completion;
+            // the dynamic wrapper and the other backends are out of scope.
+            if (comptime xev.dynamic or xev.backend != .io_uring) return error.SkipZigTest;
+            const testing = std.testing;
+
+            var tpool = ThreadPool.init(.{});
+            defer tpool.deinit();
+            defer tpool.shutdown();
+            var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
+            defer loop.deinit();
+
+            const address = try std.Io.net.IpAddress.parse("127.0.0.1", 3133);
+            const server = try Impl.init(address);
+            try server.bind(address);
+            var c_read: xev.Completion = undefined;
+            var s_read: Impl.State = undefined;
+            var recv_buf: [128]u8 = undefined;
+            var outcome: ?xev.ReadError!usize = null;
+            server.read(&loop, &c_read, &s_read, .{ .slice = &recv_buf }, ?(xev.ReadError!usize), &outcome, (struct {
+                fn callback(
+                    ud: ?*?(xev.ReadError!usize),
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    _: *Impl.State,
+                    peer: std.Io.net.IpAddress,
+                    _: Impl,
+                    _: xev.ReadBuffer,
+                    r: xev.ReadError!usize,
+                ) xev.CallbackAction {
+                    _ = r catch {
+                        std.debug.assert(peer.getPort() == 0);
+                    };
+                    ud.?.* = r;
+                    return .disarm;
+                }
+            }).callback);
+            try loop.run(.no_wait);
+
+            var c_cancel: xev.Completion = .{
+                .op = .{ .cancel = .{ .c = &c_read } },
+                .userdata = null,
+                .callback = (struct {
+                    fn callback(_: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
+                        return .disarm;
+                    }
+                }).callback,
+            };
+            loop.add(&c_cancel);
+            try loop.run(.until_done);
+            try testing.expect(outcome != null);
+            try testing.expectError(error.Canceled, outcome.?);
+            _ = posix.system.close(server.fd);
         }
 
         test "UDP: read/write" {
